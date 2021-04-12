@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/gomodule/redigo/redis"
+	"github.com/seaguest/common/logger"
 )
 
 type RedisCache struct {
@@ -14,12 +15,16 @@ type RedisCache struct {
 	muxm sync.Map
 
 	mem *MemCache
+
+	// hit cnt
+	stat *Statistic
 }
 
-func NewRedisCache(p *redis.Pool, m *MemCache) *RedisCache {
+func NewRedisCache(name string, p *redis.Pool, m *MemCache) *RedisCache {
 	c := &RedisCache{
 		pool: p,
 		mem:  m,
+		stat: NewStatistic(name + "_reids"),
 	}
 	return c
 }
@@ -46,12 +51,15 @@ func (c *RedisCache) Get(key string, obj interface{}) (*Item, bool) {
 		mux.RUnlock()
 	}()
 
+	c.stat.addTotal(1)
 	// check if item is fresh in mem, return directly if true
+	// 防缓存穿透
 	if v, fresh := c.mem.Load(key); fresh {
 		return v, true
 	}
 
 	body, err := RedisGetString(key, c.pool)
+	logger.Info("get data from redis.", body, err)
 	if err != nil && err != redis.ErrNil {
 		return nil, false
 	}
@@ -65,6 +73,7 @@ func (c *RedisCache) Get(key string, obj interface{}) (*Item, bool) {
 	if err != nil {
 		return nil, false
 	}
+	c.stat.addHit(1)
 	c.mem.Set(key, &it)
 	return &it, true
 }
@@ -78,6 +87,7 @@ func (c *RedisCache) load(key string, obj interface{}, ttl int, f LoadFunc, sync
 		mux.Unlock()
 	}()
 
+	// 防缓存穿透
 	if it, fresh := c.mem.Load(key); fresh {
 		if sync {
 			return clone(it.Object, obj)
@@ -86,6 +96,7 @@ func (c *RedisCache) load(key string, obj interface{}, ttl int, f LoadFunc, sync
 	}
 
 	o, err := f()
+	logger.Info("run f.", o, err)
 	if err != nil {
 		return err
 	}

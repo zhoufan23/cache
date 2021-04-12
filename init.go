@@ -7,8 +7,8 @@ import (
 
 var cache *Cache
 
-func Init(redisAddr, redisPwd string, maxconn int) {
-	cache = New(redisAddr, redisPwd, maxconn)
+func Init(cacheName, redisAddr, redisPwd string, maxconn int) {
+	cache = New(cacheName, redisAddr, redisPwd, maxconn)
 }
 
 func GetKey(args ...interface{}) string {

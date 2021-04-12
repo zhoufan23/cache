@@ -7,8 +7,9 @@ import (
 	"time"
 
 	"github.com/gomodule/redigo/redis"
-	"github.com/json-iterator/go"
+	jsoniter "github.com/json-iterator/go"
 	"github.com/mohae/deepcopy"
+	"github.com/seaguest/common/logger"
 )
 
 const (
@@ -18,6 +19,9 @@ const (
 )
 
 type Cache struct {
+	// cache name
+	name string
+
 	// redis connection
 	pool *redis.Pool
 
@@ -35,11 +39,13 @@ type LoadFunc func() (interface{}, error)
 
 var json = jsoniter.ConfigCompatibleWithStandardLibrary
 
-func New(redisAddr, redisPassword string, maxConnection int) *Cache {
-	c := &Cache{}
+func New(cacheName, redisAddr, redisPassword string, maxConnection int) *Cache {
+	c := &Cache{
+		name: cacheName,
+	}
 	c.pool = GetRedisPool(redisAddr, redisPassword, maxConnection)
-	c.mem = NewMemCache(cleanInterval)
-	c.rds = NewRedisCache(c.pool, c.mem)
+	c.mem = NewMemCache(c.name, cleanInterval)
+	c.rds = NewRedisCache(c.name, c.pool, c.mem)
 
 	// subscribe key deletion
 	go c.subscribe(delKeyChannel)
@@ -57,6 +63,7 @@ func (c *Cache) EnableDebug() {
 // sync memcache from redis
 func (c *Cache) syncMem(key string, copy interface{}, ttl int, f LoadFunc) {
 	it, ok := c.rds.Get(key, copy)
+	logger.Info("load data from redis and sync mem:", it, ok)
 	// if key not exists in redis or data outdated, then load from redis
 	if !ok || it.Outdated() {
 		c.rds.load(key, nil, ttl, f, false)
@@ -67,19 +74,23 @@ func (c *Cache) syncMem(key string, copy interface{}, ttl int, f LoadFunc) {
 
 func (c *Cache) getObjectWithExpiration(key string, obj interface{}, ttl int, f LoadFunc) error {
 	v, ok := c.mem.Get(key)
+	logger.Info("query data from mem.", key, v, ok)
 	if ok {
 		if v.Outdated() {
 			to := deepcopy.Copy(obj)
 			go c.syncMem(key, to, ttl, f)
 		}
+		logger.Info("query data from mem success.", v.Outdated(), v.Object, obj)
 		return clone(v.Object, obj)
 	}
 
 	v, ok = c.rds.Get(key, obj)
+	logger.Info("query data from redis: ", v, ok)
 	if ok {
 		if v.Outdated() {
 			go c.rds.load(key, nil, ttl, f, false)
 		}
+		logger.Info("query data from redis success. ", v.Outdated(), v.Object, obj)
 		return clone(v.Object, obj)
 	}
 	return c.rds.load(key, obj, ttl, f, true)
@@ -133,9 +144,13 @@ func clone(src, dst interface{}) (err error) {
 		}
 	}()
 
+	logger.Info("deepcopy start...")
 	v := deepcopy.Copy(src)
+	logger.Info("deepcopy end...")
 	if reflect.ValueOf(v).IsValid() {
+		logger.Info("deepcopy2 start...")
 		reflect.ValueOf(dst).Elem().Set(reflect.Indirect(reflect.ValueOf(v)))
+		logger.Info("deepcopy2 end...")
 	}
 	return
 }
