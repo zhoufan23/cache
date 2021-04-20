@@ -4,8 +4,6 @@ package cache
 import (
 	"sync"
 	"time"
-
-	"github.com/seaguest/common/logger"
 )
 
 type MemCache struct {
@@ -29,7 +27,6 @@ func NewMemCache(name string, ci time.Duration) *MemCache {
 }
 
 func (c *MemCache) Set(k string, it *Item) {
-	logger.Info("update mem: ", k, it)
 	c.items.Store(k, it)
 }
 
@@ -72,7 +69,6 @@ func (c *MemCache) Load(k string) (*Item, bool) {
 func (c *MemCache) Get(k string) (*Item, bool) {
 	c.stat.addTotal(1) //记录一次缓存查询
 	tmp, found := c.items.Load(k)
-	logger.Info("get data from mem.", tmp, found)
 	if !found {
 		return nil, false
 	}

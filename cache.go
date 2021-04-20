@@ -4,12 +4,12 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"sync"
 	"time"
 
 	"github.com/gomodule/redigo/redis"
 	jsoniter "github.com/json-iterator/go"
 	"github.com/mohae/deepcopy"
-	"github.com/seaguest/common/logger"
 )
 
 const (
@@ -21,6 +21,9 @@ const (
 type Cache struct {
 	// cache name
 	name string
+
+	// RWMutex map for each cache key
+	muxm sync.Map
 
 	// redis connection
 	pool *redis.Pool
@@ -63,37 +66,90 @@ func (c *Cache) EnableDebug() {
 // sync memcache from redis
 func (c *Cache) syncMem(key string, copy interface{}, ttl int, f LoadFunc) {
 	it, ok := c.rds.Get(key, copy)
-	logger.Info("load data from redis and sync mem:", it, ok)
+
 	// if key not exists in redis or data outdated, then load from redis
 	if !ok || it.Outdated() {
-		c.rds.load(key, nil, ttl, f, false)
+		c.load(key, nil, ttl, f, false)
 		return
 	}
 	c.mem.Set(key, it)
 }
 
+// store one mutex per key
+// TODO, mux should be released when no more accessed
+func (c *Cache) getMutex(key string) *sync.RWMutex {
+	var mux *sync.RWMutex
+	nMux := new(sync.RWMutex)
+	if oMux, ok := c.muxm.LoadOrStore(key, nMux); ok {
+		mux = oMux.(*sync.RWMutex)
+		nMux = nil
+	} else {
+		mux = nMux
+	}
+	return mux
+}
+
+func (c *Cache) load(key string, obj interface{}, ttl int, f LoadFunc, sync bool) error {
+	o, err := f()
+	if err != nil {
+		return err
+	}
+
+	if sync {
+		if err := clone(o, obj); err != nil {
+			return err
+		}
+	}
+
+	// update redis cache
+	it := NewItem(o, ttl)
+	rdsTTL := (it.Expiration - time.Now().UnixNano()) / int64(time.Second)
+	bs, _ := json.Marshal(it)
+
+	if err := c.rds.Set(key, string(bs), int(rdsTTL)); err != nil {
+		return err
+	}
+
+	// update mem cache
+	c.mem.Set(key, it)
+	return nil
+}
+
 func (c *Cache) getObjectWithExpiration(key string, obj interface{}, ttl int, f LoadFunc) error {
+	// 查询本地缓存
 	v, ok := c.mem.Get(key)
-	logger.Info("query data from mem.", key, v, ok)
-	if ok {
-		if v.Outdated() {
+	if ok { //本地缓存查询成功
+		if v.Outdated() { //数据实效性不满足时需异步更新
 			to := deepcopy.Copy(obj)
 			go c.syncMem(key, to, ttl, f)
 		}
-		logger.Info("query data from mem success.", v.Outdated(), v.Object, obj)
 		return clone(v.Object, obj)
 	}
 
-	v, ok = c.rds.Get(key, obj)
-	logger.Info("query data from redis: ", v, ok)
-	if ok {
-		if v.Outdated() {
-			go c.rds.load(key, nil, ttl, f, false)
-		}
-		logger.Info("query data from redis success. ", v.Outdated(), v.Object, obj)
+	// 不存在 or 数据过期
+	// 防缓存穿透
+	mux := c.getMutex(key)
+	mux.RLock()
+	defer func() {
+		mux.RUnlock()
+	}()
+
+	// 获取互斥锁成功后判断本地缓存实效性是否ok
+	if v, fresh := c.mem.Load(key); fresh {
 		return clone(v.Object, obj)
 	}
-	return c.rds.load(key, obj, ttl, f, true)
+
+	// 查询redis缓存
+	v, ok = c.rds.Get(key, obj)
+	if ok { //redis缓存查询成功
+		if v.Outdated() { //数据实效性不满足时需异步更新
+			go c.load(key, nil, ttl, f, false)
+		} else {
+			c.mem.Set(key, v) // 更新本地缓存
+		}
+		return clone(v.Object, obj)
+	}
+	return c.load(key, obj, ttl, f, true)
 }
 
 func (c *Cache) GetObject(key string, obj interface{}, ttl int, f LoadFunc) error {
@@ -144,13 +200,9 @@ func clone(src, dst interface{}) (err error) {
 		}
 	}()
 
-	logger.Info("deepcopy start...")
 	v := deepcopy.Copy(src)
-	logger.Info("deepcopy end...")
 	if reflect.ValueOf(v).IsValid() {
-		logger.Info("deepcopy2 start...")
 		reflect.ValueOf(dst).Elem().Set(reflect.Indirect(reflect.ValueOf(v)))
-		logger.Info("deepcopy2 end...")
 	}
 	return
 }
